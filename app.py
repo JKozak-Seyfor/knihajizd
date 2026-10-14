@@ -2,8 +2,10 @@ import json
 import os
 import re
 import tempfile
+import time
 from datetime import date
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -17,16 +19,30 @@ import streamlit as st
 st.set_page_config(
     page_title="Kontrola knih jízd | Seyfor",
     page_icon="🚙",
-    layout="wide"
+    layout="wide",
 )
 
-MANAGERS_FILE = Path(__file__).resolve().parent / "spravci.json"
+BASE_DIR = Path(__file__).resolve().parent
+MANAGERS_FILE = BASE_DIR / "spravci.json"
 
 MONTH_NAMES = [
-    "Leden", "Únor", "Březen", "Duben",
-    "Květen", "Červen", "Červenec", "Srpen",
-    "Září", "Říjen", "Listopad", "Prosinec"
+    "Leden",
+    "Únor",
+    "Březen",
+    "Duben",
+    "Květen",
+    "Červen",
+    "Červenec",
+    "Srpen",
+    "Září",
+    "Říjen",
+    "Listopad",
+    "Prosinec",
 ]
+
+POLL_INTERVAL = 5
+MAX_WAIT_SECONDS = 900
+REQUEST_TIMEOUT = (15, 60)
 
 
 # ============================================================
@@ -34,8 +50,6 @@ MONTH_NAMES = [
 # ============================================================
 
 def load_managers():
-    """Načte seznam správců ze souboru spravci.json."""
-
     if not MANAGERS_FILE.exists():
         return {}
 
@@ -63,8 +77,6 @@ def load_managers():
 
 
 def save_managers(managers):
-    """Bezpečně uloží seznam správců do JSON souboru."""
-
     temp_name = None
 
     try:
@@ -74,7 +86,7 @@ def save_managers(managers):
             dir=MANAGERS_FILE.parent,
             prefix=".spravci-",
             suffix=".tmp",
-            delete=False
+            delete=False,
         ) as handle:
 
             temp_name = handle.name
@@ -83,13 +95,12 @@ def save_managers(managers):
                 managers,
                 handle,
                 ensure_ascii=False,
-                indent=2
+                indent=2,
             )
 
             handle.write("\n")
 
         os.replace(temp_name, MANAGERS_FILE)
-
         return True
 
     except OSError as exc:
@@ -104,12 +115,10 @@ def save_managers(managers):
 
 
 def valid_email(email):
-    """Ověří základní syntaxi e-mailové adresy."""
-
     return bool(
         re.fullmatch(
             r"[^\s@]+@[^\s@]+\.[^\s@]+",
-            email
+            email,
         )
     )
 
@@ -119,12 +128,226 @@ def valid_email(email):
 # ============================================================
 
 def load_endpoint():
-    """Načte URL Power Automate ze Streamlit Secrets."""
-
     try:
-        return str(st.secrets["POWER_AUTOMATE_URL"])
+        return str(
+            st.secrets["POWER_AUTOMATE_URL"]
+        ).strip()
     except Exception:
         return ""
+
+
+def validate_poll_url(location, endpoint):
+    """
+    Ověří, že polling URL používá HTTPS
+    a stejný hostitel jako nakonfigurovaný endpoint.
+
+    Pokud Microsoft vrátí jiného hostitele,
+    požadavek se z bezpečnostních důvodů zastaví.
+    """
+
+    poll_url = urljoin(endpoint, location)
+
+    original = urlparse(endpoint)
+    target = urlparse(poll_url)
+
+    if target.scheme.lower() != "https":
+        raise ValueError(
+            "Polling URL nepoužívá HTTPS."
+        )
+
+    if target.hostname != original.hostname:
+        raise ValueError(
+            "Power Automate vrátilo polling URL "
+            "na jiném hostiteli. "
+            "Automatické přesměrování bylo "
+            "z bezpečnostních důvodů zablokováno."
+        )
+
+    if target.port not in (None, 443):
+        raise ValueError(
+            "Polling URL používá nepovolený port."
+        )
+
+    if target.username or target.password:
+        raise ValueError(
+            "Polling URL obsahuje nepovolené "
+            "přihlašovací údaje."
+        )
+
+    return poll_url
+
+
+def parse_json_response(response):
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise ValueError(
+            "Power Automate nevrátilo validní JSON."
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise ValueError(
+            "Odpověď Power Automate není JSON objekt."
+        )
+
+    return result
+
+
+def get_retry_interval(response):
+    retry_after = response.headers.get("Retry-After")
+
+    if retry_after:
+        try:
+            seconds = int(retry_after)
+
+            if 1 <= seconds <= 60:
+                return seconds
+
+        except ValueError:
+            pass
+
+    return POLL_INTERVAL
+
+
+def run_flow_async(endpoint, body, status_placeholder):
+    """
+    Spustí Power Automate.
+
+    HTTP 200:
+        Vrátí finální JSON.
+
+    HTTP 202 + Location:
+        Pravidelně kontroluje dokončení.
+
+    HTTP 202 bez Location:
+        Vyvolá chybu.
+    """
+
+    with requests.Session() as session:
+
+        status_placeholder.info(
+            "Odesílám požadavek do Power Automate…"
+        )
+
+        response = session.post(
+            endpoint,
+            json=body,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
+        )
+
+        initial_status = response.status_code
+
+        if 300 <= initial_status < 400:
+            raise ValueError(
+                "Power Automate vrátilo přesměrování "
+                "místo očekávané odpovědi."
+            )
+
+        response.raise_for_status()
+
+        if initial_status != 202:
+            status_placeholder.success(
+                f"Power Automate odpovědělo "
+                f"HTTP {initial_status}."
+            )
+
+            return parse_json_response(response)
+
+        location = response.headers.get("Location")
+
+        if not location:
+            raise ValueError(
+                "Power Automate vrátilo HTTP 202, "
+                "ale odpověď neobsahuje hlavičku Location. "
+                "Nelze zjistit stav asynchronního běhu."
+            )
+
+        poll_url = validate_poll_url(
+            location,
+            endpoint,
+        )
+
+        status_placeholder.info(
+            "Power Automate přijalo požadavek "
+            "(HTTP 202). Čekám na dokončení kontroly…"
+        )
+
+        deadline = time.monotonic() + MAX_WAIT_SECONDS
+        poll_count = 0
+
+        while time.monotonic() < deadline:
+
+            interval = get_retry_interval(response)
+
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                break
+
+            time.sleep(
+                min(interval, remaining)
+            )
+
+            poll_count += 1
+
+            elapsed = (
+                MAX_WAIT_SECONDS
+                - max(
+                    0,
+                    deadline - time.monotonic()
+                )
+            )
+
+            status_placeholder.info(
+                "Kontrola stále probíhá… "
+                f"Uplynulo {int(elapsed)} sekund. "
+                f"Dotaz na stav #{poll_count}."
+            )
+
+            response = session.get(
+                poll_url,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=False,
+            )
+
+            if 300 <= response.status_code < 400:
+                raise ValueError(
+                    "Polling endpoint vrátil "
+                    "nepovolené přesměrování."
+                )
+
+            response.raise_for_status()
+
+            if response.status_code == 202:
+
+                next_location = response.headers.get(
+                    "Location"
+                )
+
+                if next_location:
+                    poll_url = validate_poll_url(
+                        next_location,
+                        endpoint,
+                    )
+
+                continue
+
+            result = parse_json_response(response)
+
+            status_placeholder.success(
+                "Power Automate dokončilo kontrolu. "
+                f"Finální HTTP status: "
+                f"{response.status_code}."
+            )
+
+            return result
+
+        raise TimeoutError(
+            "Kontrola nebyla dokončena do 15 minut. "
+            "Flow může stále pokračovat. "
+            "Zkontroluj historii běhu Power Automate."
+        )
 
 
 # ============================================================
@@ -132,11 +355,14 @@ def load_endpoint():
 # ============================================================
 
 def normalize_findings(payload):
-    """Převede nálezy z JSON odpovědi do tabulkové podoby."""
-
     rows = []
 
-    for finding in payload.get("findings", []):
+    findings = payload.get("findings", [])
+
+    if not isinstance(findings, list):
+        return rows
+
+    for finding in findings:
 
         if not isinstance(finding, dict):
             continue
@@ -146,10 +372,25 @@ def normalize_findings(payload):
             "Závažnost": finding.get("severity", ""),
             "Pravidlo": finding.get("rule", ""),
             "Řádek": finding.get("row", ""),
-            "Popis": finding.get("message", "")
+            "Popis": finding.get("message", ""),
         })
 
     return rows
+
+
+def validate_result(result, expected_email, expected_period):
+    response_email = str(
+        result.get("adminEmail") or ""
+    ).strip().lower()
+
+    response_period = str(
+        result.get("period") or ""
+    ).strip()
+
+    return (
+        response_email == expected_email
+        and response_period == expected_period
+    )
 
 
 # ============================================================
@@ -163,8 +404,8 @@ st.caption(
 )
 
 st.info(
-    "Vyber správce a období. Kontrola zpracuje knihy "
-    "přiřazené vybranému správci. "
+    "Vyber správce a období. Kontrola zpracuje "
+    "knihy přiřazené vybranému správci. "
     "Výběr správce není ověření identity uživatele."
 )
 
@@ -173,7 +414,7 @@ endpoint = load_endpoint()
 
 tab_check, tab_admin = st.tabs([
     "🚙 Kontrola knih jízd",
-    "👥 Správa správců"
+    "👥 Správa správců",
 ])
 
 
@@ -218,7 +459,7 @@ with tab_check:
                     list(managers),
                     format_func=lambda name: (
                         f"{name} — {managers[name]}"
-                    )
+                    ),
                 )
 
             with col2:
@@ -227,7 +468,7 @@ with tab_check:
                     "Měsíc",
                     range(1, 13),
                     index=now.month - 1,
-                    format_func=lambda m: MONTH_NAMES[m - 1]
+                    format_func=lambda m: MONTH_NAMES[m - 1],
                 )
 
             with col3:
@@ -235,115 +476,127 @@ with tab_check:
                 year = st.selectbox(
                     "Rok",
                     years,
-                    index=years.index(now.year)
+                    index=years.index(now.year),
                 )
 
             submitted = st.form_submit_button(
                 "Spustit kontrolu",
                 type="primary",
-                use_container_width=True
+                use_container_width=True,
             )
-
-        # ----------------------------------------------------
-        # SPUŠTĚNÍ POWER AUTOMATE
-        # ----------------------------------------------------
 
         if submitted:
 
             period = f"{year}-{month:02d}"
 
+            expected_email = managers[selected]
+
             body = {
                 "period": period,
-                "adminEmail": managers[selected]
+                "adminEmail": expected_email,
             }
 
-            # Odstranění výsledků předchozí kontroly
-            st.session_state.pop("latest_result", None)
-            st.session_state.pop("latest_manager", None)
+            st.session_state.pop(
+                "latest_result",
+                None,
+            )
+
+            st.session_state.pop(
+                "latest_manager",
+                None,
+            )
+
+            status_placeholder = st.empty()
 
             try:
 
                 with st.spinner(
-                    "Probíhá kontrola knih jízd. "
-                    "Zpracování může trvat několik minut…"
+                    "Probíhá kontrola knih jízd…"
                 ):
 
-                    response = requests.post(
-                        endpoint,
-                        json=body,
-                        timeout=(15, 240)
+                    result = run_flow_async(
+                        endpoint=endpoint,
+                        body=body,
+                        status_placeholder=status_placeholder,
                     )
 
-                    response.raise_for_status()
-
-                    result = response.json()
-
-                if not isinstance(result, dict):
-                    raise ValueError(
-                        "Odpověď není JSON objekt."
-                    )
-
-                response_email = str(
-                    result.get("adminEmail") or ""
-                ).strip().lower()
-
-                response_period = result.get("period")
-
-                if (
-                    response_email != managers[selected]
-                    or response_period != period
+                if not validate_result(
+                    result,
+                    expected_email,
+                    period,
                 ):
 
                     st.error(
-                        "Odpověď neodpovídá požadovanému "
-                        "správci nebo období. "
+                        "Finální odpověď neodpovídá "
+                        "požadovanému správci nebo období. "
                         "Výsledky nebyly zobrazeny."
+                    )
+
+                    st.warning(
+                        "Zkontroluj, zda Power Automate "
+                        "vrací finální JSON přímo, "
+                        "nebo jej balí do dalšího objektu."
+                    )
+
+                    st.write(
+                        "Dostupné klíče odpovědi:",
+                        list(result.keys()),
                     )
 
                 else:
 
-                    st.session_state["latest_result"] = result
-                    st.session_state["latest_manager"] = selected
+                    st.session_state[
+                        "latest_result"
+                    ] = result
+
+                    st.session_state[
+                        "latest_manager"
+                    ] = selected
 
                     st.success(
-                        "Kontrola byla dokončena."
+                        "Kontrola byla úspěšně dokončena."
                     )
 
             except requests.exceptions.Timeout:
 
                 st.error(
-                    "Časový limit požadavku vypršel. "
+                    "Vypršel časový limit HTTP požadavku. "
                     "Flow může stále pokračovat. "
-                    "Před opakováním zkontroluj historii "
-                    "spuštění Power Automate."
+                    "Před opakováním zkontroluj "
+                    "historii spuštění Power Automate."
                 )
 
             except requests.exceptions.RequestException as exc:
 
                 st.error(
-                    "Volání Power Automate selhalo "
+                    "Komunikace s Power Automate selhala "
                     f"({type(exc).__name__}). "
-                    "Zkontroluj historii spuštění flow "
-                    "a nastavení endpointu."
+                    "Zkontroluj historii běhu flow."
                 )
 
-            except (ValueError, json.JSONDecodeError):
+            except TimeoutError as exc:
 
-                st.error(
-                    "Flow nevrátilo očekávanou JSON odpověď."
-                )
+                st.error(str(exc))
 
-    # --------------------------------------------------------
-    # ZOBRAZENÍ VÝSLEDKŮ
-    # --------------------------------------------------------
+            except ValueError as exc:
 
-    result = st.session_state.get("latest_result")
+                st.error(str(exc))
+
+    # ========================================================
+    # VÝSLEDKY KONTROLY
+    # ========================================================
+
+    result = st.session_state.get(
+        "latest_result"
+    )
 
     if result:
 
         st.divider()
 
-        st.subheader("Výsledky poslední kontroly")
+        st.subheader(
+            "Výsledky poslední kontroly"
+        )
 
         st.caption(
             f"Správce: "
@@ -355,24 +608,30 @@ with tab_check:
         col_a, col_b, col_c = st.columns(3)
 
         with col_a:
+
             st.metric(
                 "Zkontrolované knihy",
-                result.get("filesChecked", "—")
+                result.get("filesChecked", "—"),
             )
 
         with col_b:
+
             st.metric(
                 "Chyby",
-                result.get("errorsCount", "—")
+                result.get("errorsCount", "—"),
             )
 
         with col_c:
+
             st.metric(
                 "Varování",
-                result.get("warningsCount", "—")
+                result.get("warningsCount", "—"),
             )
 
-        findings = result.get("findings", [])
+        findings = result.get(
+            "findings",
+            [],
+        )
 
         if not isinstance(findings, list):
 
@@ -400,49 +659,52 @@ with tab_check:
             for filename in filenames:
 
                 file_rows = [
-                    row for row in rows
+                    row
+                    for row in rows
                     if str(row["Soubor"]) == filename
                 ]
 
                 with st.expander(
                     f"{filename} · {len(file_rows)} nálezů",
-                    expanded=True
+                    expanded=True,
                 ):
 
                     st.dataframe(
                         pd.DataFrame(file_rows),
                         hide_index=True,
-                        use_container_width=True
+                        use_container_width=True,
                     )
 
-            # Export CSV
-            csv_data = pd.DataFrame(rows).to_csv(
-                index=False
-            ).encode("utf-8-sig")
+            csv_data = (
+                pd.DataFrame(rows)
+                .to_csv(index=False)
+                .encode("utf-8-sig")
+            )
 
             st.download_button(
                 "Stáhnout nálezy jako CSV",
                 data=csv_data,
                 file_name=(
-                    f"nalez_{result.get('period', 'kontrola')}.csv"
+                    f"nalez_"
+                    f"{result.get('period', 'kontrola')}.csv"
                 ),
-                mime="text/csv"
+                mime="text/csv",
             )
 
-        # Export JSON
         json_data = json.dumps(
             result,
             ensure_ascii=False,
-            indent=2
+            indent=2,
         ).encode("utf-8")
 
         st.download_button(
             "Stáhnout JSON odpověď",
             data=json_data,
             file_name=(
-                f"kontrola_{result.get('period', 'vysledek')}.json"
+                f"kontrola_"
+                f"{result.get('period', 'vysledek')}.json"
             ),
-            mime="application/json"
+            mime="application/json",
         )
 
 
@@ -468,7 +730,7 @@ with tab_admin:
         manager_rows = [
             {
                 "Správce": name,
-                "Pracovní e-mail": email
+                "Pracovní e-mail": email,
             }
             for name, email in sorted(managers.items())
         ]
@@ -476,7 +738,7 @@ with tab_admin:
         st.dataframe(
             pd.DataFrame(manager_rows),
             hide_index=True,
-            use_container_width=True
+            use_container_width=True,
         )
 
     else:
@@ -493,22 +755,22 @@ with tab_admin:
 
     with st.form(
         "add_manager",
-        clear_on_submit=True
+        clear_on_submit=True,
     ):
 
         new_name = st.text_input(
             "Jméno správce",
-            placeholder="Jan Marschik"
+            placeholder="Jan Marschik",
         )
 
         new_email = st.text_input(
             "Pracovní e-mail",
-            placeholder="jan.marschik@seyfor.com"
+            placeholder="jan.marschik@seyfor.com",
         )
 
         add_manager = st.form_submit_button(
             "Přidat správce",
-            type="primary"
+            type="primary",
         )
 
     if add_manager:
@@ -548,7 +810,7 @@ with tab_admin:
 
             updated_managers = {
                 **managers,
-                name: email
+                name: email,
             }
 
             if save_managers(updated_managers):
@@ -572,7 +834,7 @@ with tab_admin:
         remove_name = st.selectbox(
             "Vyber správce k odebrání",
             sorted(managers),
-            key="remove_manager"
+            key="remove_manager",
         )
 
         st.caption(
@@ -585,7 +847,7 @@ with tab_admin:
 
         if st.button(
             "Odebrat správce",
-            disabled=not confirm_remove
+            disabled=not confirm_remove,
         ):
 
             updated_managers = dict(managers)
@@ -615,6 +877,6 @@ with tab_admin:
     st.caption(
         "Při hostingu s dočasným souborovým systémem "
         "nemusí změny přežít restart nebo nové nasazení. "
-        "Souborové ukládání také není vhodné pro "
-        "současné úpravy více uživateli."
+        "Souborové ukládání také není vhodné "
+        "pro současné úpravy více uživateli."
     )
