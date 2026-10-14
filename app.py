@@ -534,4 +534,87 @@ with tab_admin:
         ):
 
             st.error(
-                "Správce s tímto jmén
+                "Správce s tímto jménem již existuje."
+            )
+
+        elif email in managers.values():
+
+            st.error(
+                "Tento e-mail je již přiřazen "
+                "jinému správci."
+            )
+
+        else:
+
+            updated_managers = {
+                **managers,
+                name: email
+            }
+
+            if save_managers(updated_managers):
+
+                st.success(
+                    f"Správce {name} byl přidán."
+                )
+
+                st.rerun()
+
+    # --------------------------------------------------------
+    # ODEBRÁNÍ SPRÁVCE
+    # --------------------------------------------------------
+
+    if managers:
+
+        st.divider()
+
+        st.markdown("### Odebrat správce")
+
+        remove_name = st.selectbox(
+            "Vyber správce k odebrání",
+            sorted(managers),
+            key="remove_manager"
+        )
+
+        st.caption(
+            f"E-mail: {managers[remove_name]}"
+        )
+
+        confirm_remove = st.checkbox(
+            "Potvrzuji odebrání vybraného správce"
+        )
+
+        if st.button(
+            "Odebrat správce",
+            disabled=not confirm_remove
+        ):
+
+            updated_managers = dict(managers)
+
+            del updated_managers[remove_name]
+
+            if save_managers(updated_managers):
+
+                st.success(
+                    f"Správce {remove_name} byl odebrán."
+                )
+
+                st.rerun()
+
+    # --------------------------------------------------------
+    # BEZPEČNOSTNÍ UPOZORNĚNÍ
+    # --------------------------------------------------------
+
+    st.divider()
+
+    st.warning(
+        "Správa správců není chráněna přihlášením. "
+        "Každý uživatel s přístupem k aplikaci "
+        "může seznam upravovat."
+    )
+
+    st.caption(
+        "Při hostingu s dočasným souborovým systémem "
+        "nemusí změny přežít restart nebo nové nasazení. "
+        "Souborové ukládání také není vhodné pro "
+        "současné úpravy více uživateli."
+    )
