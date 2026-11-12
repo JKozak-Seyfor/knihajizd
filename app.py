@@ -188,7 +188,7 @@ def run_flow_async(endpoint, body, status_box):
             )
 
         status_box.info("HTTP 202: požadavek přijat. Čekám na dokončení kontroly…")
-        deadline = time.monotonic() + 900
+        deadline = time.monotonic() + 3600
         attempts = 0
         while time.monotonic() < deadline:
             retry_after = response.headers.get("Retry-After", "5")
@@ -207,7 +207,7 @@ def run_flow_async(endpoint, body, status_box):
                 raise ValueError(f"Neočekávaný status při načítání výsledku: {response.status_code}.")
             status_box.success("Kontrola dokončena. Výsledek byl načten.")
             return parse_result(response)
-        raise TimeoutError("Kontrola nebyla dokončena do 15 minut. Flow může stále běžet.")
+        raise TimeoutError("Kontrola nebyla dokončena do 60 minut. Flow může stále běžet.")
 
 
 st.title("Kontrola knih jízd")
