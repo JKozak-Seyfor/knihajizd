@@ -11,6 +11,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Kontrola knih jízd | Seyfor", page_icon="🚙", layout="wide")
 GITHUB_FILE = "data/spravci.json"
+CONTACTS_FILE = "data/kontakty.json"
 MONTH_NAMES = ["Leden", "Únor", "Březen", "Duben", "Květen", "Červen", "Červenec", "Srpen", "Září", "Říjen", "Listopad", "Prosinec"]
 
 
@@ -26,11 +27,11 @@ def github_config():
         raise RuntimeError("Chybí nebo je neplatná konfigurace GitHubu ve Streamlit Secrets.") from None
 
 
-def github_file_url(cfg):
+def github_file_url(cfg, file_path=GITHUB_FILE):
     from urllib.parse import quote
     owner = quote(cfg["GITHUB_OWNER"], safe="")
     repo = quote(cfg["GITHUB_REPO"], safe="")
-    path = "/".join(quote(p, safe="") for p in GITHUB_FILE.split("/"))
+    path = "/".join(quote(p, safe="") for p in file_path.split("/"))
     return f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
 
 
@@ -117,6 +118,79 @@ def load_endpoint():
         return str(st.secrets["POWER_AUTOMATE_URL"]).strip()
     except Exception:
         return ""
+
+
+
+def normalize_email(value):
+    return value.strip().casefold() if isinstance(value, str) else ""
+
+
+def resolve_contacts(records, managers):
+    """Resolve active contact-to-admin links; never use contactEmail as adminEmail."""
+    if not isinstance(records, list):
+        raise ValueError("data/kontakty.json musí obsahovat pole objektů.")
+    admin_index = {}
+    for name, email in managers.items():
+        admin_index.setdefault(normalize_email(email), []).append(name)
+    contacts, problems = {}, []
+    for number, row in enumerate(records, 1):
+        prefix = f"Kontakty, řádek {number}: "
+        if not isinstance(row, dict):
+            problems.append(prefix + "očekáván objekt; záznam vynechán.")
+            continue
+        # Optional future flags: a disabled link is never offered.
+        if row.get("active") is False or row.get("enabled") is False:
+            continue
+        if any(key in row and not isinstance(row[key], bool) for key in ("active", "enabled")):
+            problems.append(prefix + "active/enabled musí být true nebo false; záznam vynechán.")
+            continue
+        name = row.get("contactName")
+        email = normalize_email(row.get("contactEmail"))
+        admin_email = normalize_email(row.get("adminEmail"))
+        if not isinstance(name, str) or not name.strip() or not valid_email(email) or not valid_email(admin_email):
+            problems.append(prefix + "chybí platné contactName, contactEmail nebo adminEmail; záznam vynechán.")
+            continue
+        matches = admin_index.get(admin_email, [])
+        if len(matches) != 1:
+            reason = "správce není v data/spravci.json" if not matches else "e-mail správce je v data/spravci.json vícekrát"
+            problems.append(prefix + reason + "; vazba není dostupná.")
+            continue
+        entry = contacts.setdefault(email, {"name": name.strip(), "email": email, "admins": []})
+        if matches[0] not in entry["admins"]:
+            entry["admins"].append(matches[0])
+    return contacts, problems
+
+
+def load_contacts(managers):
+    """Authenticated GitHub Contents API, same repository and Secrets as administrators."""
+    try:
+        cfg = github_config()
+        response = requests.get(
+            github_file_url(cfg, CONTACTS_FILE),
+            headers=github_headers(cfg),
+            params={"ref": cfg["GITHUB_BRANCH"]},
+            timeout=(10, 30),
+        )
+        response.raise_for_status()
+        file_data = response.json()
+        if file_data.get("type") != "file" or not isinstance(file_data.get("content"), str):
+            raise ValueError("GitHub nevrátil očekávaný soubor data/kontakty.json.")
+        records = json.loads(base64.b64decode(file_data["content"]).decode("utf-8-sig"))
+        contacts, problems = resolve_contacts(records, managers)
+        for problem in problems:
+            st.warning(problem)
+        return contacts
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        st.error(
+            f"Kontakty nelze načíst (HTTP {status}). Ověř data/kontakty.json, větev a oprávnění tokenu "
+            "ke čtení soukromého repozitáře. Režim kontaktu není dostupný."
+        )
+    except requests.exceptions.RequestException:
+        st.error("Kontakty nelze načíst kvůli chybě spojení s GitHubem. Režim kontaktu není dostupný.")
+    except (ValueError, RuntimeError, KeyError, TypeError, AttributeError):
+        st.error("Kontakty nelze načíst: ověř konfiguraci a platný JSON ve formátu pole objektů s contactName, contactEmail a adminEmail.")
+    return None
 
 
 def normalize_findings(payload):
@@ -212,7 +286,7 @@ def run_flow_async(endpoint, body, status_box):
 
 st.title("Kontrola knih jízd")
 st.caption("Seyfor · Interní demonstrační aplikace")
-st.info("Výběr správce není ověření identity. Aplikace neposkytuje oddělení přístupu k výsledkům podle uživatele.")
+st.info("Výběr správce ani kontaktu není ověření identity. Aplikace neposkytuje oddělení přístupu k výsledkům podle uživatele.")
 
 managers = load_managers()
 endpoint = load_endpoint()
@@ -228,17 +302,50 @@ with tab_check:
     now = date.today()
     years = list(range(now.year - 3, now.year + 2))
     if endpoint and managers:
-        with st.form("logbook_check"):
-            col1, col2, col3 = st.columns([2.1, 1, 1])
-            with col1:
-                selected = st.selectbox("Správce knih jízd", list(managers), format_func=lambda name: f"{name} — {managers[name]}")
-            with col2:
-                month = st.selectbox("Měsíc", range(1, 13), index=now.month - 1, format_func=lambda m: MONTH_NAMES[m - 1])
-            with col3:
-                year = st.selectbox("Rok", years, index=years.index(now.year))
-            submitted = st.form_submit_button("Spustit kontrolu", type="primary", use_container_width=True)
+        mode = st.radio("Kontrolu spouštím jako", ["Správce", "Kontakt správce"], horizontal=True)
+        selected = None
+        contact_email = None
+        if mode == "Správce":
+            selected = st.selectbox(
+                "Správce knih jízd", list(managers),
+                format_func=lambda name: f"{name} — {managers[name]}", key="direct_admin",
+            )
+        else:
+            contacts = load_contacts(managers)
+            if contacts:
+                contact_email = st.selectbox(
+                    "Kontakt správce", list(contacts),
+                    format_func=lambda email: f"{contacts[email]['name']} — {email}",
+                    key="selected_contact",
+                )
+                selected = st.selectbox(
+                    "Za kterého správce spustit kontrolu", contacts[contact_email]["admins"],
+                    format_func=lambda name: f"{name} — {managers[name]}",
+                    key=f"contact_admin_{contact_email}",
+                )
+                st.caption("Do flow se odešle e-mail vybraného správce. Příjemce e-mailů nadále určuje flow.")
+            elif contacts == {}:
+                st.warning("V data/kontakty.json nejsou žádné aktivní platné vazby na správce. Kontrolu za kontakt nelze spustit.")
 
-        if submitted:
+        # Do not display a previous person's result after changing the selection.
+        context = (mode, contact_email, selected)
+        if st.session_state.get("selection_context") != context:
+            st.session_state.pop("latest_result", None)
+            st.session_state.pop("latest_manager", None)
+            st.session_state["selection_context"] = context
+
+        with st.form("logbook_check"):
+            col1, col2 = st.columns(2)
+            with col1:
+                month = st.selectbox("Měsíc", range(1, 13), index=now.month - 1, format_func=lambda m: MONTH_NAMES[m - 1])
+            with col2:
+                year = st.selectbox("Rok", years, index=years.index(now.year))
+            submitted = st.form_submit_button(
+                "Spustit kontrolu", type="primary", use_container_width=True,
+                disabled=selected is None,
+            )
+
+        if submitted and selected is not None:
             period = f"{year}-{month:02d}"
             expected_email = managers[selected]
             st.session_state.pop("latest_result", None)
@@ -249,7 +356,7 @@ with tab_check:
                     result = run_flow_async(endpoint, {"period": period, "adminEmail": expected_email}, status_box)
                 response_email = str(result.get("adminEmail") or "").strip().lower()
                 response_period = str(result.get("period") or "").strip()
-                if response_email != expected_email or response_period != period:
+                if response_email != normalize_email(expected_email) or response_period != period:
                     st.error(
                         "Výsledek neodpovídá požadovanému správci nebo období. "
                         "Ověř, že flow vrací finální JSON s adminEmail a period. "
