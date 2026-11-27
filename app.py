@@ -286,7 +286,7 @@ def run_flow_async(endpoint, body, status_box):
 
 st.title("Kontrola knih jízd")
 st.caption("Seyfor · Interní demonstrační aplikace")
-st.info("Výběr správce ani kontaktu není ověření identity. Aplikace neposkytuje oddělení přístupu k výsledkům podle uživatele.")
+st.info("Výběr správce není ověření identity. Aplikace neposkytuje oddělení přístupu k výsledkům podle uživatele.")
 
 managers = load_managers()
 endpoint = load_endpoint()
@@ -302,33 +302,13 @@ with tab_check:
     now = date.today()
     years = list(range(now.year - 3, now.year + 2))
     if endpoint and managers:
-        mode = st.radio("Kontrolu spouštím jako", ["Správce", "Kontakt správce"], horizontal=True)
-        selected = None
-        contact_email = None
-        if mode == "Správce":
-            selected = st.selectbox(
-                "Správce knih jízd", list(managers),
-                format_func=lambda name: f"{name} — {managers[name]}", key="direct_admin",
-            )
-        else:
-            contacts = load_contacts(managers)
-            if contacts:
-                contact_email = st.selectbox(
-                    "Kontakt správce", list(contacts),
-                    format_func=lambda email: f"{contacts[email]['name']} — {email}",
-                    key="selected_contact",
-                )
-                selected = st.selectbox(
-                    "Za kterého správce spustit kontrolu", contacts[contact_email]["admins"],
-                    format_func=lambda name: f"{name} — {managers[name]}",
-                    key=f"contact_admin_{contact_email}",
-                )
-                st.caption("Do flow se odešle e-mail vybraného správce. Příjemce e-mailů nadále určuje flow.")
-            elif contacts == {}:
-                st.warning("V data/kontakty.json nejsou žádné aktivní platné vazby na správce. Kontrolu za kontakt nelze spustit.")
+        selected = st.selectbox(
+            "Správce knih jízd", list(managers),
+            format_func=lambda name: f"{name} — {managers[name]}", key="direct_admin",
+        )
 
         # Do not display a previous person's result after changing the selection.
-        context = (mode, contact_email, selected)
+        context = ("Správce", None, selected)
         if st.session_state.get("selection_context") != context:
             st.session_state.pop("latest_result", None)
             st.session_state.pop("latest_manager", None)
