@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 import time
@@ -9,62 +10,187 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Kontrola knih jízd | Seyfor", page_icon="🚙", layout="wide")
+GITHUB_FILE = "data/spravci.json"
+CONTACTS_FILE = "data/kontakty.json"
 MONTH_NAMES = ["Leden", "Únor", "Březen", "Duben", "Květen", "Červen", "Červenec", "Srpen", "Září", "Říjen", "Listopad", "Prosinec"]
 
 
-def normalize_email(value):
-    return str(value or "").strip().lower()
-
-
-def configured_url(key):
+def github_config():
+    keys = ("GITHUB_TOKEN", "GITHUB_OWNER", "GITHUB_REPO", "GITHUB_BRANCH")
     try:
-        raw = st.secrets.get(key, "")
-    except (FileNotFoundError, KeyError):
+        cfg = {key: str(st.secrets[key]).strip() for key in keys}
+        if not all(cfg.values()):
+            raise ValueError("Prázdná hodnota konfigurace GitHubu.")
+        return cfg
+    except (KeyError, ValueError, Exception) as exc:
+        # Nevypisovat hodnoty konfigurace ani token.
+        raise RuntimeError("Chybí nebo je neplatná konfigurace GitHubu ve Streamlit Secrets.") from None
+
+
+def github_file_url(cfg, file_path=GITHUB_FILE):
+    from urllib.parse import quote
+    owner = quote(cfg["GITHUB_OWNER"], safe="")
+    repo = quote(cfg["GITHUB_REPO"], safe="")
+    path = "/".join(quote(p, safe="") for p in file_path.split("/"))
+    return f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+
+
+def github_headers(cfg):
+    return {
+        "Authorization": f"Bearer {cfg['GITHUB_TOKEN']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def fetch_managers():
+    cfg = github_config()
+    response = requests.get(
+        github_file_url(cfg),
+        headers=github_headers(cfg),
+        params={"ref": cfg["GITHUB_BRANCH"]},
+        timeout=(10, 30),
+    )
+    response.raise_for_status()
+    file_data = response.json()
+    if file_data.get("type") != "file" or not file_data.get("sha"):
+        raise ValueError("GitHub nevrátil očekávaný soubor a jeho SHA.")
+    content = base64.b64decode(file_data["content"], validate=False).decode("utf-8")
+    managers = json.loads(content)
+    if not isinstance(managers, dict):
+        raise ValueError("data/spravci.json musí obsahovat JSON objekt.")
+    result = {}
+    for name, email in managers.items():
+        name, email = str(name).strip(), str(email).strip().lower()
+        if not name or not valid_email(email):
+            raise ValueError("data/spravci.json obsahuje neplatné jméno nebo e-mail.")
+        result[name] = email
+    return result, file_data["sha"]
+
+
+def load_managers():
+    try:
+        managers, sha = fetch_managers()
+        st.session_state["managers_sha"] = sha
+        return managers
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        st.error(f"GitHub seznam správců nelze načíst (HTTP {status}). Zkontroluj repozitář, větev a oprávnění tokenu.")
+    except (requests.exceptions.RequestException, ValueError, RuntimeError, KeyError) as exc:
+        st.error(f"GitHub seznam správců nelze načíst: {type(exc).__name__}. Zkontroluj konfiguraci a soubor.")
+    return None
+
+
+def save_managers(managers, expected_sha):
+    try:
+        cfg = github_config()
+        content = (json.dumps(managers, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        response = requests.put(
+            github_file_url(cfg),
+            headers=github_headers(cfg),
+            json={
+                "message": "Aktualizace seznamu správců knih jízd",
+                "content": base64.b64encode(content).decode("ascii"),
+                "sha": expected_sha,
+                "branch": cfg["GITHUB_BRANCH"],
+            },
+            timeout=(10, 30),
+        )
+        if response.status_code in (409, 422):
+            st.error("GitHub změnu odmítl. Seznam mohl mezitím změnit jiný uživatel. Obnov stránku a akci zopakuj.")
+            return False
+        response.raise_for_status()
+        return True
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        st.error(f"Zápis na GitHub selhal (HTTP {status}). Ověř Contents: Read and write a případná pravidla ochrany větve.")
+    except (requests.exceptions.RequestException, RuntimeError) as exc:
+        st.error(f"Zápis na GitHub selhal ({type(exc).__name__}).")
+    return False
+
+
+def valid_email(email):
+    return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email))
+
+
+def load_endpoint():
+    try:
+        return str(st.secrets["POWER_AUTOMATE_URL"]).strip()
+    except Exception:
         return ""
-    return raw.strip() if isinstance(raw, str) else ""
 
 
-def parse_admins(payload):
-    if not isinstance(payload, dict) or not isinstance(payload.get("admins"), list):
-        raise ValueError("Odpověď čtecího flow musí obsahovat pole admins.")
-    admins = {}
-    seen = set()
-    for item in payload["admins"]:
-        if not isinstance(item, dict):
-            raise ValueError("Seznam správců obsahuje neplatný záznam.")
-        email, name = item.get("adminEmail"), item.get("displayName")
-        if not isinstance(email, str) or not isinstance(name, str):
-            raise ValueError("V seznamu správců chybí jméno nebo e-mail.")
-        email, name = email.strip(), name.strip()
-        normalized = normalize_email(email)
-        if not name or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-            raise ValueError("V seznamu správců je neplatné jméno nebo e-mail.")
-        if normalized in seen:
-            raise ValueError("Seznam správců obsahuje duplicitní e-mail.")
-        seen.add(normalized)
-        admins[email] = name
-    return dict(sorted(admins.items(), key=lambda pair: (pair[1].casefold(), pair[0].casefold())))
+
+def normalize_email(value):
+    return value.strip().casefold() if isinstance(value, str) else ""
 
 
-def fetch_admins(url):
+def resolve_contacts(records, managers):
+    """Resolve active contact-to-admin links; never use contactEmail as adminEmail."""
+    if not isinstance(records, list):
+        raise ValueError("data/kontakty.json musí obsahovat pole objektů.")
+    admin_index = {}
+    for name, email in managers.items():
+        admin_index.setdefault(normalize_email(email), []).append(name)
+    contacts, problems = {}, []
+    for number, row in enumerate(records, 1):
+        prefix = f"Kontakty, řádek {number}: "
+        if not isinstance(row, dict):
+            problems.append(prefix + "očekáván objekt; záznam vynechán.")
+            continue
+        # Optional future flags: a disabled link is never offered.
+        if row.get("active") is False or row.get("enabled") is False:
+            continue
+        if any(key in row and not isinstance(row[key], bool) for key in ("active", "enabled")):
+            problems.append(prefix + "active/enabled musí být true nebo false; záznam vynechán.")
+            continue
+        name = row.get("contactName")
+        email = normalize_email(row.get("contactEmail"))
+        admin_email = normalize_email(row.get("adminEmail"))
+        if not isinstance(name, str) or not name.strip() or not valid_email(email) or not valid_email(admin_email):
+            problems.append(prefix + "chybí platné contactName, contactEmail nebo adminEmail; záznam vynechán.")
+            continue
+        matches = admin_index.get(admin_email, [])
+        if len(matches) != 1:
+            reason = "správce není v data/spravci.json" if not matches else "e-mail správce je v data/spravci.json vícekrát"
+            problems.append(prefix + reason + "; vazba není dostupná.")
+            continue
+        entry = contacts.setdefault(email, {"name": name.strip(), "email": email, "admins": []})
+        if matches[0] not in entry["admins"]:
+            entry["admins"].append(matches[0])
+    return contacts, problems
+
+
+def load_contacts(managers):
+    """Authenticated GitHub Contents API, same repository and Secrets as administrators."""
     try:
-        parsed = urlsplit(url)
-        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
-                or parsed.password or parsed.fragment):
-            raise ValueError
-    except ValueError:
-        raise ValueError("URL čtecího flow musí být platná adresa HTTPS.") from None
-    try:
-        response = requests.post(url, json={}, timeout=(5, 15), allow_redirects=False)
+        cfg = github_config()
+        response = requests.get(
+            github_file_url(cfg, CONTACTS_FILE),
+            headers=github_headers(cfg),
+            params={"ref": cfg["GITHUB_BRANCH"]},
+            timeout=(10, 30),
+        )
+        response.raise_for_status()
+        file_data = response.json()
+        if file_data.get("type") != "file" or not isinstance(file_data.get("content"), str):
+            raise ValueError("GitHub nevrátil očekávaný soubor data/kontakty.json.")
+        records = json.loads(base64.b64decode(file_data["content"]).decode("utf-8-sig"))
+        contacts, problems = resolve_contacts(records, managers)
+        for problem in problems:
+            st.warning(problem)
+        return contacts
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        st.error(
+            f"Kontakty nelze načíst (HTTP {status}). Ověř data/kontakty.json, větev a oprávnění tokenu "
+            "ke čtení soukromého repozitáře. Režim kontaktu není dostupný."
+        )
     except requests.exceptions.RequestException:
-        raise RuntimeError("Čtecí flow není dostupné.") from None
-    if response.status_code != 200:
-        raise RuntimeError(f"Čtecí flow vrátilo HTTP {response.status_code}.")
-    try:
-        payload = response.json()
-    except ValueError:
-        raise ValueError("Čtecí flow nevrátilo platný JSON.") from None
-    return parse_admins(payload)
+        st.error("Kontakty nelze načíst kvůli chybě spojení s GitHubem. Režim kontaktu není dostupný.")
+    except (ValueError, RuntimeError, KeyError, TypeError, AttributeError):
+        st.error("Kontakty nelze načíst: ověř konfiguraci a platný JSON ve formátu pole objektů s contactName, contactEmail a adminEmail.")
+    return None
 
 
 def normalize_findings(payload):
@@ -159,109 +285,154 @@ def run_flow_async(endpoint, body, status_box):
 
 
 st.title("Kontrola knih jízd")
-st.caption("Seyfor · Testovací rozhraní pro pověřenou obsluhu")
-st.info("Správce se upravují v SharePointu. Výběr správce neověřuje jeho identitu.")
+st.caption("Seyfor · Interní demonstrační aplikace")
+st.info("Výběr správce ani kontaktu není ověření identity. Aplikace neposkytuje oddělení přístupu k výsledkům podle uživatele.")
 
-reader_url = configured_url("POWER_AUTOMATE_READER_URL")
-if not reader_url:
-    st.error("Chybí POWER_AUTOMATE_READER_URL ve Streamlit Secrets.")
-    st.stop()
+managers = load_managers()
+endpoint = load_endpoint()
+tab_check, tab_admin = st.tabs(["🚙 Kontrola knih jízd", "👥 Správa správců"])
 
-try:
-    managers = fetch_admins(reader_url)
-except (ValueError, RuntimeError) as exc:
-    st.error(str(exc))
-    st.stop()
+with tab_check:
+    st.subheader("Spustit kontrolu")
+    if not endpoint:
+        st.error("Chybí POWER_AUTOMATE_URL ve Streamlit Secrets.")
+    if managers == {}:
+        st.info("Nejprve přidej správce v záložce Správa správců.")
 
-if not managers:
-    st.info("V SharePointu nejsou žádní aktivní správci.")
-    st.stop()
-
-def admin_label(email):
-    name = managers[email]
-    return f"{name} ({email})" if list(managers.values()).count(name) > 1 else name
-
-selected = st.selectbox(
-    "Správce knih jízd",
-    options=list(managers),
-    index=None,
-    placeholder="Vyber správce",
-    format_func=admin_label,
-    key="direct_admin",
-)
-if st.session_state.get("selection_context") != selected:
-    st.session_state.pop("latest_result", None)
-    st.session_state.pop("latest_manager", None)
-    st.session_state["selection_context"] = selected
-
-# Require a separately identified test checker. No production endpoint fallback.
-endpoint = configured_url("POWER_AUTOMATE_CHECK_TEST_URL")
-if not endpoint:
-    st.info("Režim pouze pro čtení. Kontrolní flow se nespouští.")
-    st.stop()
-
-now = date.today()
-years = list(range(now.year - 3, now.year + 2))
-with st.form("logbook_check"):
-    col1, col2 = st.columns(2)
-    with col1:
-        month = st.selectbox("Měsíc", range(1, 13), index=now.month - 1, format_func=lambda m: MONTH_NAMES[m - 1])
-    with col2:
-        year = st.selectbox("Rok", years, index=years.index(now.year))
-    submitted = st.form_submit_button(
-        "Spustit kontrolu", type="primary", use_container_width=True,
-        disabled=selected is None,
-    )
-
-if submitted and selected is not None:
-    period = f"{year}-{month:02d}"
-    expected_email = selected
-    st.session_state.pop("latest_result", None)
-    st.session_state.pop("latest_manager", None)
-    status_box = st.empty()
-    try:
-        with st.spinner("Probíhá kontrola knih jízd…"):
-            result = run_flow_async(endpoint, {"period": period, "adminEmail": expected_email}, status_box)
-        response_email = str(result.get("adminEmail") or "").strip().lower()
-        response_period = str(result.get("period") or "").strip()
-        if response_email != normalize_email(expected_email) or response_period != period:
-            st.error(
-                "Výsledek neodpovídá požadovanému správci nebo období. "
-                "Ověř, že flow vrací finální JSON s adminEmail a period. "
-                "Výsledky nebyly zobrazeny."
+    now = date.today()
+    years = list(range(now.year - 3, now.year + 2))
+    if endpoint and managers:
+        mode = st.radio("Kontrolu spouštím jako", ["Správce", "Kontakt správce"], horizontal=True)
+        selected = None
+        contact_email = None
+        if mode == "Správce":
+            selected = st.selectbox(
+                "Správce knih jízd", list(managers),
+                format_func=lambda name: f"{name} — {managers[name]}", key="direct_admin",
             )
-            st.caption(f"Přítomnost polí: adminEmail={'ano' if 'adminEmail' in result else 'ne'}, period={'ano' if 'period' in result else 'ne'}")
-        elif not isinstance(result.get("findings"), list):
-            st.error("Výsledná odpověď neobsahuje pole findings ve formátu seznamu.")
         else:
-            st.session_state["latest_result"] = result
-            st.session_state["latest_manager"] = managers[selected]
-            st.success("Výsledky kontroly jsou připraveny.")
-    except requests.exceptions.Timeout:
-        st.error("Vypršel časový limit HTTP požadavku. Zkontroluj historii běhu flow před opakováním.")
-    except requests.exceptions.RequestException as exc:
-        st.error(f"HTTP komunikace selhala ({type(exc).__name__}). Zkontroluj běh flow.")
-    except (ValueError, TimeoutError) as exc:
-        st.error(str(exc))
+            contacts = load_contacts(managers)
+            if contacts:
+                contact_email = st.selectbox(
+                    "Kontakt správce", list(contacts),
+                    format_func=lambda email: f"{contacts[email]['name']} — {email}",
+                    key="selected_contact",
+                )
+                selected = st.selectbox(
+                    "Za kterého správce spustit kontrolu", contacts[contact_email]["admins"],
+                    format_func=lambda name: f"{name} — {managers[name]}",
+                    key=f"contact_admin_{contact_email}",
+                )
+                st.caption("Do flow se odešle e-mail vybraného správce. Příjemce e-mailů nadále určuje flow.")
+            elif contacts == {}:
+                st.warning("V data/kontakty.json nejsou žádné aktivní platné vazby na správce. Kontrolu za kontakt nelze spustit.")
 
+        # Do not display a previous person's result after changing the selection.
+        context = (mode, contact_email, selected)
+        if st.session_state.get("selection_context") != context:
+            st.session_state.pop("latest_result", None)
+            st.session_state.pop("latest_manager", None)
+            st.session_state["selection_context"] = context
 
-result = st.session_state.get("latest_result")
-if result:
-    st.divider()
-    st.subheader("Výsledky poslední kontroly")
-    st.caption(f"Správce: {st.session_state.get('latest_manager', '—')} | Období: {result.get('period', '—')} | RunID: {result.get('runId', '—')}")
-    a, b, c = st.columns(3)
-    a.metric("Zkontrolované knihy", result.get("filesChecked", "—"))
-    b.metric("Chyby", result.get("errorsCount", "—"))
-    c.metric("Varování", result.get("warningsCount", "—"))
-    findings = result.get("findings", [])
-    if not findings:
-        st.success("Kontrola nevrátila žádné nálezy.")
-    else:
-        rows = normalize_findings(result)
-        for filename in sorted({str(row["Soubor"]) for row in rows}):
-            file_rows = [row for row in rows if str(row["Soubor"]) == filename]
-            with st.expander(f"{filename or 'Neuvedený soubor'} · {len(file_rows)} nálezů", expanded=True):
-                st.dataframe(pd.DataFrame(file_rows), hide_index=True, use_container_width=True)
-        st.download_button("Stáhnout nálezy jako CSV", pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig"), file_name=f"nalez_{result.get('period', 'kontrola')}.csv", mime="text/csv")
-    st.download_button("Stáhnout JSON odpověď", json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8"), file_name=f"kontrola_{result.get('period', 'vysledek')}.json", mime="application/json")
+        with st.form("logbook_check"):
+            col1, col2 = st.columns(2)
+            with col1:
+                month = st.selectbox("Měsíc", range(1, 13), index=now.month - 1, format_func=lambda m: MONTH_NAMES[m - 1])
+            with col2:
+                year = st.selectbox("Rok", years, index=years.index(now.year))
+            submitted = st.form_submit_button(
+                "Spustit kontrolu", type="primary", use_container_width=True,
+                disabled=selected is None,
+            )
+
+        if submitted and selected is not None:
+            period = f"{year}-{month:02d}"
+            expected_email = managers[selected]
+            st.session_state.pop("latest_result", None)
+            st.session_state.pop("latest_manager", None)
+            status_box = st.empty()
+            try:
+                with st.spinner("Probíhá kontrola knih jízd…"):
+                    result = run_flow_async(endpoint, {"period": period, "adminEmail": expected_email}, status_box)
+                response_email = str(result.get("adminEmail") or "").strip().lower()
+                response_period = str(result.get("period") or "").strip()
+                if response_email != normalize_email(expected_email) or response_period != period:
+                    st.error(
+                        "Výsledek neodpovídá požadovanému správci nebo období. "
+                        "Ověř, že flow vrací finální JSON s adminEmail a period. "
+                        "Výsledky nebyly zobrazeny."
+                    )
+                    st.caption(f"Přítomnost polí: adminEmail={'ano' if 'adminEmail' in result else 'ne'}, period={'ano' if 'period' in result else 'ne'}")
+                elif not isinstance(result.get("findings"), list):
+                    st.error("Výsledná odpověď neobsahuje pole findings ve formátu seznamu.")
+                else:
+                    st.session_state["latest_result"] = result
+                    st.session_state["latest_manager"] = selected
+                    st.success("Výsledky kontroly jsou připraveny.")
+            except requests.exceptions.Timeout:
+                st.error("Vypršel časový limit HTTP požadavku. Zkontroluj historii běhu flow před opakováním.")
+            except requests.exceptions.RequestException as exc:
+                st.error(f"HTTP komunikace selhala ({type(exc).__name__}). Zkontroluj běh flow.")
+            except (ValueError, TimeoutError) as exc:
+                st.error(str(exc))
+
+    result = st.session_state.get("latest_result")
+    if result:
+        st.divider()
+        st.subheader("Výsledky poslední kontroly")
+        st.caption(f"Správce: {st.session_state.get('latest_manager', '—')} | Období: {result.get('period', '—')} | RunID: {result.get('runId', '—')}")
+        a, b, c = st.columns(3)
+        a.metric("Zkontrolované knihy", result.get("filesChecked", "—"))
+        b.metric("Chyby", result.get("errorsCount", "—"))
+        c.metric("Varování", result.get("warningsCount", "—"))
+        findings = result.get("findings", [])
+        if not findings:
+            st.success("Kontrola nevrátila žádné nálezy.")
+        else:
+            rows = normalize_findings(result)
+            for filename in sorted({str(row["Soubor"]) for row in rows}):
+                file_rows = [row for row in rows if str(row["Soubor"]) == filename]
+                with st.expander(f"{filename or 'Neuvedený soubor'} · {len(file_rows)} nálezů", expanded=True):
+                    st.dataframe(pd.DataFrame(file_rows), hide_index=True, use_container_width=True)
+            st.download_button("Stáhnout nálezy jako CSV", pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig"), file_name=f"nalez_{result.get('period', 'kontrola')}.csv", mime="text/csv")
+        st.download_button("Stáhnout JSON odpověď", json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8"), file_name=f"kontrola_{result.get('period', 'vysledek')}.json", mime="application/json")
+
+with tab_admin:
+    st.subheader("Správa správců")
+    st.caption("Seznam se čte a zapisuje do data/spravci.json na GitHubu. Token je uložen ve Streamlit Secrets.")
+    if managers is not None and managers:
+        st.dataframe(pd.DataFrame([{"Správce": name, "Pracovní e-mail": email} for name, email in sorted(managers.items())]), hide_index=True, use_container_width=True)
+    elif managers == {}:
+        st.info("Zatím není přidán žádný správce.")
+
+    st.markdown("### Přidat správce")
+    with st.form("add_manager", clear_on_submit=True):
+        new_name = st.text_input("Jméno správce", placeholder="Jan Marschik")
+        new_email = st.text_input("Pracovní e-mail", placeholder="jan.marschik@seyfor.com")
+        add_manager = st.form_submit_button("Přidat správce", type="primary")
+    if add_manager and managers is not None:
+        name, email = new_name.strip(), new_email.strip().lower()
+        if not name:
+            st.error("Vyplň jméno správce.")
+        elif not valid_email(email):
+            st.error("Zadej platnou e-mailovou adresu.")
+        elif name.casefold() in (n.casefold() for n in managers):
+            st.error("Správce s tímto jménem již existuje.")
+        elif email in managers.values():
+            st.error("Tento e-mail je již přiřazen jinému správci.")
+        elif save_managers({**managers, name: email}, st.session_state["managers_sha"]):
+            st.rerun()
+
+    if managers is not None and managers:
+        st.divider()
+        st.markdown("### Odebrat správce")
+        remove_name = st.selectbox("Vyber správce k odebrání", sorted(managers), key="remove_manager")
+        st.caption(f"E-mail: {managers[remove_name]}")
+        confirm_remove = st.checkbox("Potvrzuji odebrání vybraného správce")
+        if st.button("Odebrat správce", disabled=not confirm_remove):
+            updated = dict(managers)
+            del updated[remove_name]
+            if save_managers(updated, st.session_state["managers_sha"]):
+                st.rerun()
+    st.warning("Správa správců není chráněna přihlášením. Každý s přístupem k aplikaci může seznam měnit.")
+    st.caption("Změny se commitují do GitHubu. Souběžné změny jsou chráněny kontrolou SHA; při konfliktu obnov stránku.")
