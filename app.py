@@ -1,3 +1,131 @@
+import json
+import re
+import time
+from datetime import date
+from urllib.parse import urlsplit
+
+import pandas as pd
+import requests
+import streamlit as st
+
+st.set_page_config(page_title="Kontrola knih jízd | Seyfor", page_icon="🚙", layout="wide")
+MONTH_NAMES = ["Leden", "Únor", "Březen", "Duben", "Květen", "Červen", "Červenec", "Srpen", "Září", "Říjen", "Listopad", "Prosinec"]
+
+
+def normalize_email(value):
+    return str(value or "").strip().lower()
+
+
+def configured_url(key):
+    try:
+        raw = st.secrets.get(key, "")
+    except (FileNotFoundError, KeyError):
+        return ""
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+def parse_admins(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("admins"), list):
+        raise ValueError("Odpověď čtecího flow musí obsahovat pole admins.")
+    admins = {}
+    seen = set()
+    for item in payload["admins"]:
+        if not isinstance(item, dict):
+            raise ValueError("Seznam správců obsahuje neplatný záznam.")
+        email, name = item.get("adminEmail"), item.get("displayName")
+        if not isinstance(email, str) or not isinstance(name, str):
+            raise ValueError("V seznamu správců chybí jméno nebo e-mail.")
+        email, name = email.strip(), name.strip()
+        normalized = normalize_email(email)
+        if not name or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            raise ValueError("V seznamu správců je neplatné jméno nebo e-mail.")
+        if normalized in seen:
+            raise ValueError("Seznam správců obsahuje duplicitní e-mail.")
+        seen.add(normalized)
+        admins[email] = name
+    return dict(sorted(admins.items(), key=lambda pair: (pair[1].casefold(), pair[0].casefold())))
+
+
+def fetch_admins(url):
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or parsed.fragment):
+            raise ValueError
+    except ValueError:
+        raise ValueError("URL čtecího flow musí být platná adresa HTTPS.") from None
+    try:
+        response = requests.post(url, json={}, timeout=(5, 15), allow_redirects=False)
+    except requests.exceptions.RequestException:
+        raise RuntimeError("Čtecí flow není dostupné.") from None
+    if response.status_code != 200:
+        raise RuntimeError(f"Čtecí flow vrátilo HTTP {response.status_code}.")
+    try:
+        payload = response.json()
+    except ValueError:
+        raise ValueError("Čtecí flow nevrátilo platný JSON.") from None
+    return parse_admins(payload)
+
+
+def normalize_findings(payload):
+    rows = []
+    for finding in payload.get("findings", []):
+        if not isinstance(finding, dict):
+            continue
+        rows.append({
+            "Soubor": finding.get("file", ""),
+            "Závažnost": finding.get("severity", ""),
+            "Pravidlo": finding.get("rule", ""),
+            "Řádek": finding.get("row", ""),
+            "Popis": finding.get("message", ""),
+        })
+    return rows
+
+
+def is_safe_poll_url(location, endpoint):
+    """Restrict polling to HTTPS and the same origin as the configured flow endpoint.
+
+    Some Power Automate configurations may return a different Microsoft-owned
+    status host; do not silently permit it. Review and explicitly allow it if needed.
+    """
+    try:
+        poll = urlsplit(location)
+        trigger = urlsplit(endpoint)
+        return (
+            poll.scheme == "https"
+            and trigger.scheme == "https"
+            and poll.hostname is not None
+            and poll.hostname.lower() == trigger.hostname.lower()
+            and (poll.port or 443) == (trigger.port or 443)
+            and not poll.username and not poll.password
+            and not poll.fragment
+        )
+    except ValueError:
+        return False
+
+
+def parse_result(response):
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError("Power Automate nevrátilo platný JSON.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Odpověď Power Automate není JSON objekt.")
+    return payload
+
+
+def run_flow_async(endpoint, body, status_box):
+    """Return final JSON, supporting 202/Location polling where available."""
+    with requests.Session() as session:
+        response = session.post(endpoint, json=body, timeout=(15, 90), allow_redirects=False)
+        status_box.info(f"Počáteční HTTP status: {response.status_code}")
+        response.raise_for_status()
+
+        if response.status_code == 200:
+            return parse_result(response)
+        if response.status_code != 202:
+            raise ValueError(f"Neočekávaný HTTP status {response.status_code}.")
+
         location = response.headers.get("Location")
         if not location:
             raise ValueError("Flow vrátilo 202 bez hlavičky Location. Zkontroluj nastavení Asynchronous response.")
